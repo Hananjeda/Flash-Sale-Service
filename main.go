@@ -1,320 +1,192 @@
-package scheduler
+package main
 
 import (
 	"context"
-	"crypto/rand"
-	"database/sql"
-	"encoding/hex"
-	"fmt"
 	"log"
-	"math/big"
+	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
 	"time"
 
-	"flash-sale-service/internal/database"
-	"flash-sale-service/internal/models"
-	redisClient "flash-sale-service/internal/redis"
+	"github.com/Hananjeda/Flash-Sale-Service/internal/database"
+	"github.com/Hananjeda/Flash-Sale-Service/internal/handlers"
+	"github.com/Hananjeda/Flash-Sale-Service/internal/redis"
+	"github.com/Hananjeda/Flash-Sale-Service/internal/scheduler"
+	"github.com/Hananjeda/Flash-Sale-Service/internal/middleware"
 )
 
-type Scheduler struct {
-	db    *database.DB
-	redis *redisClient.Client
+// Config holds application configuration
+type Config struct {
+	Port     int
+	Database database.Config
+	Redis    redis.Config
 }
 
-// NewScheduler creates a new scheduler instance
-func NewScheduler(db *database.DB, redis *redisClient.Client) *Scheduler {
-	return &Scheduler{
-		db:    db,
-		redis: redis,
+// getEnv returns environment variable value or default
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+// getEnvInt returns environment variable as integer or default
+func getEnvInt(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		if intValue, err := strconv.Atoi(value); err == nil {
+			return intValue
+		}
+	}
+	return defaultValue
+}
+
+// loadConfig loads configuration from environment variables
+func loadConfig() Config {
+	return Config{
+		Port: getEnvInt("PORT", 8080),
+		Database: database.Config{
+			Host:     getEnv("DB_HOST", "localhost"),
+			Port:     getEnvInt("DB_PORT", 5432),
+			User:     getEnv("DB_USER", "postgres"),
+			Password: getEnv("DB_PASSWORD", "password"),
+			DBName:   getEnv("DB_NAME", "flashsale"),
+			SSLMode:  getEnv("DB_SSLMODE", "disable"),
+		},
+		Redis: redis.Config{
+			Addr:     getEnv("REDIS_ADDR", "localhost:6379"),
+			Password: getEnv("REDIS_PASSWORD", ""),
+			DB:       getEnvInt("REDIS_DB", 0),
+		},
 	}
 }
 
-// generateSaleID generates a unique sale ID
-func generateSaleID() (string, error) {
-	bytes := make([]byte, 8)
-	if _, err := rand.Read(bytes); err != nil {
-		return "", err
-	}
-	timestamp := time.Now().Unix()
-	return fmt.Sprintf("sale_%d_%s", timestamp, hex.EncodeToString(bytes)), nil
+// corsMiddleware adds CORS headers
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		
+		next.ServeHTTP(w, r)
+	})
 }
 
-// generateItemID generates a unique item ID
-func generateItemID() (string, error) {
-	bytes := make([]byte, 8)
-	if _, err := rand.Read(bytes); err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("item_%s", hex.EncodeToString(bytes)), nil
+// loggingMiddleware logs HTTP requests
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		
+		// Create a response writer wrapper to capture status code
+		wrapper := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		
+		next.ServeHTTP(wrapper, r)
+		
+		duration := time.Since(start)
+		log.Printf("%s %s %d %v", r.Method, r.URL.Path, wrapper.statusCode, duration)
+	})
 }
 
-// Item name templates for variety
-var itemNameTemplates = []string{
-	"Premium %s Collection",
-	"Limited Edition %s",
-	"Exclusive %s Series",
-	"Designer %s Set",
-	"Luxury %s Bundle",
-	"Special %s Edition",
-	"Artisan %s Collection",
-	"Elite %s Package",
-	"Signature %s Line",
-	"Master %s Series",
+// responseWriter wraps http.ResponseWriter to capture status code
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
 }
 
-var itemCategories = []string{
-	"Smartphone", "Laptop", "Headphones", "Watch", "Camera", "Tablet", "Speaker", "Gaming Console",
-	"Fitness Tracker", "Smart TV", "Keyboard", "Mouse", "Monitor", "Printer", "Router", "Drone",
-	"VR Headset", "Smart Home Hub", "Wireless Charger", "Power Bank", "Bluetooth Earbuds", "Webcam",
-	"External Drive", "Graphics Card", "Processor", "Memory Card", "USB Cable", "Phone Case",
-	"Screen Protector", "Car Charger", "Desk Lamp", "Office Chair", "Backpack", "Wallet",
-	"Sunglasses", "Perfume", "Skincare Set", "Makeup Kit", "Hair Dryer", "Electric Toothbrush",
-	"Coffee Maker", "Blender", "Air Fryer", "Vacuum Cleaner", "Humidifier", "Air Purifier",
-	"Yoga Mat", "Dumbbells", "Resistance Bands", "Protein Powder", "Water Bottle", "Running Shoes",
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
 }
 
-var colorVariants = []string{
-	"Black", "White", "Silver", "Gold", "Rose Gold", "Blue", "Red", "Green", "Purple", "Pink",
-	"Gray", "Bronze", "Copper", "Titanium", "Space Gray", "Midnight", "Starlight", "Ocean Blue",
-	"Forest Green", "Sunset Orange", "Deep Purple", "Coral", "Mint", "Lavender", "Crimson",
-}
+func main() {
+	log.Println("Starting Flash Sale Service...")
 
-// generateItemName generates a random item name
-func generateItemName() (string, error) {
-	// Select random template
-	templateIndex, err := rand.Int(rand.Reader, big.NewInt(int64(len(itemNameTemplates))))
+	// Load configuration
+	config := loadConfig()
+	log.Printf("Configuration loaded: Port=%d, DB=%s:%d, Redis=%s", 
+		config.Port, config.Database.Host, config.Database.Port, config.Redis.Addr)
+
+	// Initialize database
+	db, err := database.ConnectDB()
 	if err != nil {
-		return "", err
+		log.Fatalf("Failed to connect to database: %v", err)
 	}
-	template := itemNameTemplates[templateIndex.Int64()]
+	defer db.Close()
 
-	// Select random category
-	categoryIndex, err := rand.Int(rand.Reader, big.NewInt(int64(len(itemCategories))))
+	// Initialize Redis
+	redisClient, err := redis.ConnectRedis()
 	if err != nil {
-		return "", err
+		log.Fatalf("Failed to connect to Redis: %v", err)
 	}
-	category := itemCategories[categoryIndex.Int64()]
+	defer redisClient.Close()
 
-	// Select random color
-	colorIndex, err := rand.Int(rand.Reader, big.NewInt(int64(len(colorVariants))))
-	if err != nil {
-		return "", err
-	}
-	color := colorVariants[colorIndex.Int64()]
+	// Initialize scheduler
+	scheduler.StartScheduler(db)
 
-	// Combine category and color
-	categoryWithColor := fmt.Sprintf("%s %s", color, category)
+	// Create rate limiter
+	rateLimiter := middleware.NewRateLimiter(100, 200) // 100 requests per second, burst of 200
 
-	return fmt.Sprintf(template, categoryWithColor), nil
-}
-
-// generateImageURL generates a placeholder image URL
-func generateImageURL(itemID string) string {
-	// Use a placeholder image service with item-specific parameters
-	width := 400
-	height := 400
+	// Setup HTTP routes
+	mux := http.NewServeMux()
 	
-	// Generate a seed based on item ID for consistent images
-	seed := 0
-	for _, char := range itemID {
-		seed += int(char)
-	}
+	// API routes
+	mux.HandleFunc("/checkout", handlers.CheckoutHandler(db, redisClient))
+	mux.HandleFunc("/purchase", handlers.PurchaseHandler(db, redisClient))
+	mux.HandleFunc("/health", handlers.HealthCheck(db, redisClient))
+	mux.HandleFunc("/stats", handlers.GetStats(db))
 	
-	return fmt.Sprintf("https://picsum.photos/seed/%d/%d/%d", seed, width, height)
-}
+	// Root route
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"success": true, "message": "Flash Sale Service is running", "version": "1.0.0"}`))
+	})
 
-// generateItems generates the specified number of items for a sale
-func (s *Scheduler) generateItems(saleID string, count int) ([]models.Item, error) {
-	items := make([]models.Item, count)
+	// Apply middleware
+	finalHandler := corsMiddleware(loggingMiddleware(middleware.RateLimitMiddleware(mux, rateLimiter)))
+
+	// Create HTTP server
+	server := &http.Server{
+		Addr:         "0.0.0.0:" + strconv.Itoa(config.Port),
+		Handler:      finalHandler,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// Start server in a goroutine
+	go func() {
+		log.Printf("Server starting on port %d", config.Port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server failed to start: %v", err)
+		}
+	}()
+
+	// Wait for interrupt signal to gracefully shutdown
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
 	
-	for i := 0; i < count; i++ {
-		itemID, err := generateItemID()
-		if err != nil {
-			return nil, fmt.Errorf("failed to generate item ID: %w", err)
-		}
+	log.Println("Shutting down server...")
 
-		itemName, err := generateItemName()
-		if err != nil {
-			return nil, fmt.Errorf("failed to generate item name: %w", err)
-		}
+	// Graceful shutdown with timeout
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
 
-		imageURL := generateImageURL(itemID)
-
-		items[i] = models.Item{
-			ItemID:   itemID,
-			SaleID:   saleID,
-			Name:     itemName,
-			ImageURL: imageURL,
-		}
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Server forced to shutdown: %v", err)
 	}
 
-	return items, nil
-}
-
-// createNewSale creates a new flash sale with items
-func (s *Scheduler) createNewSale() error {
-	log.Println("Creating new flash sale...")
-
-	// Generate sale ID
-	saleID, err := generateSaleID()
-	if err != nil {
-		return fmt.Errorf("failed to generate sale ID: %w", err)
-	}
-
-	// Calculate sale times
-	now := time.Now()
-	startTime := now.Truncate(time.Hour)
-	endTime := startTime.Add(time.Hour)
-
-	// Create sale record
-	sale := &models.Sale{
-		SaleID:     saleID,
-		StartTime:  startTime,
-		EndTime:    endTime,
-		TotalItems: models.ItemsPerSale,
-		ItemsSold:  0,
-		Status:     models.SaleStatusActive,
-	}
-
-	// Save sale to database
-	if err := s.db.CreateSale(sale); err != nil {
-		return fmt.Errorf("failed to create sale in database: %w", err)
-	}
-
-	// Generate items
-	items, err := s.generateItems(saleID, models.ItemsPerSale)
-	if err != nil {
-		return fmt.Errorf("failed to generate items: %w", err)
-	}
-
-	// Save items to database
-	if err := s.db.CreateItems(items); err != nil {
-		return fmt.Errorf("failed to create items in database: %w", err)
-	}
-
-	// Initialize sale in Redis
-	if err := s.redis.InitializeSale(saleID, startTime, endTime); err != nil {
-		return fmt.Errorf("failed to initialize sale in Redis: %w", err)
-	}
-
-	log.Printf("Successfully created sale %s with %d items", saleID, len(items))
-	return nil
-}
-
-// cleanupExpiredSales marks expired sales as completed
-func (s *Scheduler) cleanupExpiredSales() error {
-	// This would typically update sales that have passed their end time
-	// For now, we'll implement a simple cleanup of expired checkout sessions
-	count, err := s.redis.CleanupExpiredCheckouts()
-	if err != nil {
-		return fmt.Errorf("failed to cleanup expired checkouts: %w", err)
-	}
-
-	if count > 0 {
-		log.Printf("Cleaned up %d expired checkout sessions", count)
-	}
-
-	return nil
-}
-
-// waitUntilNextHour waits until the next hour boundary
-func waitUntilNextHour() time.Duration {
-	now := time.Now()
-	nextHour := now.Truncate(time.Hour).Add(time.Hour)
-	return nextHour.Sub(now)
-}
-
-// Start starts the scheduler
-func (s *Scheduler) Start(ctx context.Context) error {
-	log.Println("Starting flash sale scheduler...")
-
-	// Create initial sale if none exists
-	activeSale, err := s.db.GetActiveSale()
-	if err != nil {
-		return fmt.Errorf("failed to check for active sale: %w", err)
-	}
-
-	if activeSale == nil {
-		log.Println("No active sale found, creating initial sale...")
-		if err := s.createNewSale(); err != nil {
-			return fmt.Errorf("failed to create initial sale: %w", err)
-		}
-	} else {
-		log.Printf("Found active sale: %s", activeSale.SaleID)
-	}
-
-	// Wait until the next hour boundary for the first scheduled sale
-	waitDuration := waitUntilNextHour()
-	log.Printf("Waiting %v until next scheduled sale creation", waitDuration)
-
-	select {
-	case <-time.After(waitDuration):
-		// Continue to main loop
-	case <-ctx.Done():
-		log.Println("Scheduler stopped before first scheduled sale")
-		return ctx.Err()
-	}
-
-	// Main scheduler loop - create new sale every hour
-	ticker := time.NewTicker(time.Hour)
-	defer ticker.Stop()
-
-	// Cleanup ticker - run every 15 minutes
-	cleanupTicker := time.NewTicker(15 * time.Minute)
-	defer cleanupTicker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			if err := s.createNewSale(); err != nil {
-				log.Printf("Failed to create new sale: %v", err)
-				// Continue running even if one sale creation fails
-			}
-
-		case <-cleanupTicker.C:
-			if err := s.cleanupExpiredSales(); err != nil {
-				log.Printf("Failed to cleanup expired sales: %v", err)
-				// Continue running even if cleanup fails
-			}
-
-		case <-ctx.Done():
-			log.Println("Scheduler stopped")
-			return ctx.Err()
-		}
-	}
-}
-
-func StartScheduler(db *sql.DB) {
-    ticker := time.NewTicker(1 * time.Hour)
-    go func() {
-        for {
-            <-ticker.C
-            createNewSale(db)
-        }
-    }()
-}
-
-func createNewSale(db *sql.DB) {
-    startTime := time.Now().Truncate(time.Hour)
-    endTime := startTime.Add(1 * time.Hour)
-
-    _, err := db.Exec(`
-        INSERT INTO sales (start_time, end_time, total_items)
-        VALUES ($1, $2, $3)
-    `, startTime, endTime, 10000)
-
-    if err != nil {
-        log.Printf("Error creating new sale: %v", err)
-        return
-    }
-
-    log.Printf("New sale created from %v to %v", startTime, endTime)
-
-    // Generate 10,000 items for this sale
-    generateItems(db, startTime)
-}
-
-func generateItems(db *sql.DB, saleStartTime time.Time) {
-    // Implementation for generating 10,000 unique items
-    // This is a placeholder and should be implemented with actual logic
-    log.Println("Generating 10,000 items for the new sale")
+	log.Println("Server exited")
 }
