@@ -1,8 +1,5 @@
 # Build stage
-FROM golang:1.21-alpine AS builder
-
-# Install git and ca-certificates (needed for go modules)
-RUN apk add --no-cache git ca-certificates
+FROM golang:1.20 AS builder
 
 # Set working directory
 WORKDIR /app
@@ -34,8 +31,9 @@ WORKDIR /root/
 # Copy the binary from builder stage
 COPY --from=builder /app/main .
 
-# Copy any additional files if needed
-COPY --from=builder /app/scripts ./scripts
+# Copy any additional necessary files (e.g., config files, static assets)
+COPY --from=builder /app/config ./config
+COPY --from=builder /app/static ./static
 
 # Change ownership to non-root user
 RUN chown -R appuser:appgroup /root/
@@ -52,4 +50,3 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 
 # Run the application
 CMD ["./main"]
-
