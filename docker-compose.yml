@@ -1,0 +1,134 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: flashsale-postgres
+    environment:
+      POSTGRES_DB: flashsale
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - flashsale-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d flashsale"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: flashsale-redis
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - flashsale-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Flash Sale Service
+  flashsale-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: flashsale-service
+    environment:
+      # Server Configuration
+      PORT: 8080
+      
+      # Database Configuration
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: password
+      DB_NAME: flashsale
+      DB_SSLMODE: disable
+      
+      # Redis Configuration
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ""
+      REDIS_DB: 0
+    ports:
+      - "8080:8080"
+    networks:
+      - flashsale-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  # Optional: Redis Commander for Redis management (development only)
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: flashsale-redis-commander
+    environment:
+      REDIS_HOSTS: local:redis:6379
+    ports:
+      - "8081:8081"
+    networks:
+      - flashsale-network
+    depends_on:
+      - redis
+    profiles:
+      - dev
+    restart: unless-stopped
+
+  # Optional: pgAdmin for PostgreSQL management (development only)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: flashsale-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@flashsale.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "8082:80"
+    networks:
+      - flashsale-network
+    depends_on:
+      - postgres
+    profiles:
+      - dev
+    restart: unless-stopped
+
+networks:
+  flashsale-network:
+    driver: bridge
+    name: flashsale-network
+
+volumes:
+  postgres_data:
+    name: flashsale-postgres-data
+  redis_data:
+    name: flashsale-redis-data
+
