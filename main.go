@@ -14,7 +14,6 @@ import (
 	"github.com/Hananjeda/Flash-Sale-Service/internal/handlers"
 	"github.com/Hananjeda/Flash-Sale-Service/internal/redis"
 	"github.com/Hananjeda/Flash-Sale-Service/internal/scheduler"
-	"github.com/Hananjeda/Flash-Sale-Service/internal/middleware"
 )
 
 // Config holds application configuration
@@ -129,16 +128,13 @@ func main() {
 	// Initialize scheduler
 	scheduler.StartScheduler(db)
 
-	// Create rate limiter
-	rateLimiter := middleware.NewRateLimiter(100, 200) // 100 requests per second, burst of 200
-
 	// Setup HTTP routes
 	mux := http.NewServeMux()
 	
 	// API routes
 	mux.HandleFunc("/checkout", handlers.CheckoutHandler(db, redisClient))
 	mux.HandleFunc("/purchase", handlers.PurchaseHandler(db, redisClient))
-	mux.HandleFunc("/health", handlers.HealthCheck(db, redisClient))
+	mux.HandleFunc("/health", handlers.HealthCheck)
 	mux.HandleFunc("/stats", handlers.GetStats(db))
 	
 	// Root route
@@ -154,7 +150,7 @@ func main() {
 	})
 
 	// Apply middleware
-	finalHandler := corsMiddleware(loggingMiddleware(middleware.RateLimitMiddleware(mux, rateLimiter)))
+	finalHandler := corsMiddleware(loggingMiddleware(mux))
 
 	// Create HTTP server
 	server := &http.Server{
@@ -182,6 +178,21 @@ func main() {
 
 	// Graceful shutdown with timeout
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Server forced to shutdown: %v", err)
+	}
+
+	log.Println("Server exited")
+}tdownCancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Server forced to shutdown: %v", err)
+	}
+
+	log.Println("Server exited")
+}x, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
