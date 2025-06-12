@@ -87,7 +87,7 @@ services:
         reservations:
           memory: 256M
 
-  # Optional: Redis Commander for Redis management (development only)
+  Redis Commander for Redis management (development only)
   redis-commander:
     image: rediscommander/redis-commander:latest
     container_name: flashsale-redis-commander
@@ -103,7 +103,7 @@ services:
       - dev
     restart: unless-stopped
 
-  # Optional: pgAdmin for PostgreSQL management (development only)
+  pgAdmin for PostgreSQL management (development only)
   pgadmin:
     image: dpage/pgadmin4:latest
     container_name: flashsale-pgadmin
